@@ -1,302 +1,414 @@
-import os
-import sys
 import time
-import threading
-import datetime
-from PyQt5.QtWidgets import QApplication, QWidget, QVBoxLayout, QLabel, QSystemTrayIcon, QMenu, QAction
-from PyQt5.QtGui import QFont, QIcon, QPainter, QGraphicsOpacityEffect
-from PyQt5.QtCore import Qt, QObject, pyqtSignal, QPropertyAnimation, QEventLoop
 import spotipy
+import datetime
 import syncedlyrics
+import threading
+import os
+from PyQt5.QtWidgets import *
+from PyQt5.QtGui import QFont, QPainter
+from PyQt5.QtCore import Qt, QPoint
+from PyQt5.QtCore import pyqtSignal, QObject
+from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import QPropertyAnimation, QSequentialAnimationGroup, QParallelAnimationGroup, QEasingCurve, QEventLoop
+from PyQt5.QtGui import QIcon
 import configparser
 
-class LyricsFetcher:
-    """Class to handle lyrics fetching and storage."""
-    LYRICS_DIR = "./Lyrics"
-    NO_LYRICS_FILE = os.path.join(LYRICS_DIR, "no_lyrics_list.txt")
-    CONFIG = configparser.ConfigParser("./config.ini")
-    
-    @staticmethod
-    def check_if_no_lyrics(song):
-        with open(LyricsFetcher.NO_LYRICS_FILE, "r") as f:
-            for line in f:
-                if line.strip() == song:
-                    return True
-        return False
-
-    @staticmethod
-    def fetch_lyrics(song):
-        try:
-            lrc = syncedlyrics.search(song)
-            if lrc:
-                with open(f"{LyricsFetcher.LYRICS_DIR}/{song}.lrc", "w", encoding="utf-8") as f:
-                    f.write(lrc)
-                return lrc
-            else:
-                with open(LyricsFetcher.NO_LYRICS_FILE, "a") as f:
-                    f.write(f"{song}\n")
-                return None
-        except Exception as e:
-            with open(LyricsFetcher.NO_LYRICS_FILE, "a") as f:
-                f.write(f"{song}\n")
-            raise e
-
-class SpotifyClient:
-    """Class to interact with Spotify API."""
-    SCOPE = "user-read-currently-playing"
-    
-    def __init__(self):
-        self.spotify_oauth = spotipy.SpotifyOAuth(client_id=self.CONFIG["SPOTIFY"]["CLIENT_ID"],
-                                            client_secret=self.CONFIG["SPOTIFY"]["CLIENT_SECRET"],
-                                            redirect_uri="https://google.com",
-                                            scope=self.SCOPE)
-        self.spotify = None
-    
-    def get_current_track(self):
-        try:
-            token = self.spotify_oauth.get_cached_token()
-            if token:
-                self.spotify = spotipy.Spotify(auth=token['access_token'])
-                return self.spotify.currently_playing()
-            else:
-                return None
-        except Exception as e:
-            print(f"Error getting current track: {e}")
-            return None
-
-    @staticmethod
-    def ms_to_sec(ms):
-        return int(ms / 1000)
-
-    @staticmethod
-    def ts_to_sec(ts):
-        ts = ts.strip("[]")
-        minutes, seconds = map(int, ts.split(":"))
-        return minutes * 60 + seconds
-
 class Main(QObject):
+    scope = "user-read-currently-playing"
+    song = None
+    counter = 0
+    oldTime = 0
+    startAgain = False
+
+    count = 0
+
+    current_time = datetime.datetime.now()
+    startTime = float(current_time.minute) * 60 + float(str(current_time.second) + "." + str(current_time.microsecond))
+    config = configparser.ConfigParser()
+    config.read("creds.ini")
+    print(config.get("SPOTIFY", "CLIENT_ID"))
+    print(config.get("SPOTIFY", "CLIENT_SECRET"))
+    spotifyOAuth = spotipy.SpotifyOAuth(client_id=config.get("SPOTIFY", "CLIENT_ID"),
+                                            client_secret=config.get("SPOTIFY", "CLIENT_SECRET"),
+                                            redirect_uri="https://google.com",
+                                            scope=scope)
+    paused = False
+
+    skiped = False
+
+    updated_time = 0
+    blast = False
+
+    stop_thread = False
     new_message = pyqtSignal(str)
     detail_message = pyqtSignal(str)
-    
-    def __init__(self):
-        super().__init__()
-        self.spotify_client = SpotifyClient()
-        self.song = None
-        self.raw_song = ""
-        self.updated_time = 0
-        self.blast = False
+
+    raw_song = ""
+
+
+    def check_if_song(self):
+        with open("./Lyrics/no_lyrics_list.txt", "r") as f:
+            f.readline()
+            for line in f:
+                if line == self.song or line == self.song + "\n":
+                    return True
+                
+            return False
 
     def start(self):
-        while not self.blast:
+        while True:
+            if self.blast:
+                exit()
             result = self.get_song()
-            if result is True:
-                lyrics_result = self.get_lyrics()
-                if lyrics_result is True:
-                    self.show_lyrics()
-                else:
-                    self.new_message.emit(lyrics_result)
-            else:
+            if result != True:
                 self.detail_message.emit(result)
                 self.new_message.emit("....")
-            time.sleep(1)
+                continue
+            else:
+                result = self.getlyrics()
+                if result != True:
+                    self.new_message.emit(result)
+                else:
+                    self.new_message.emit("...")
+                    result = self.show_lyrics()
+
+    def get_current(self):
+        try:
+            token = self.spotifyOAuth.get_cached_token()
+            spotifyObject = spotipy.Spotify(auth=token['access_token'])
+            current = spotifyObject.currently_playing()
+            return current
+        except:
+            return None
+    def ms_to_sec(self, ms):
+        total_seconds = ms / 1000
+        minutes = int(total_seconds // 60)
+        min_secs = int(minutes * 60)
+        seconds = int(total_seconds % 60) + min_secs
+        time_str = f"{seconds}"
+        return time_str
+
+    def ts_to_sec(self, ts):
+        ts = str(ts)
+        ts = ts.replace("]", "").replace("[", "")
+        ts = ts.split(".")[0]
+        seconds = int(ts.split(":")[0]) * 60 + int(ts.split(":")[1])
+        return seconds
 
     def get_song(self):
-        current = self.spotify_client.get_current_track()
-        if current:
-            current_type = current['currently_playing_type']
-            if current_type == "track":
-                title = f"[{current['item']['name']}] [{current['item']['artists'][0]['name']}]"
-                self.raw_song = f"{current['item']['name']} - {current['item']['artists'][0]['name']}"
-                length_ms = current['item']['duration_ms']
-                progress_ms = current['progress_ms']
-                self.updated_time = SpotifyClient.ms_to_sec(progress_ms)
-                self.song = title
-                if LyricsFetcher.check_if_no_lyrics(self.song):
-                    return f"{self.raw_song} - No Lyrics"
-                return True
-            elif current_type == "ad":
-                return "Ad Is Playing"
-        else:
-            return "Nothing Playing On Spotify"
+        try:
+            current = self.get_current()
+            # print("Current is", current)
+            if current:
+                current_type = current['currently_playing_type']
+                if current_type == "track":
+                    title = "[" + current['item']['name'] + "] [" + current["item"]["artists"][0]["name"] + "]"
+                    self.raw_song = current['item']['name'] + " - " + current["item"]["artists"][0]["name"]
+                    print("Got track", title)
+                    length_ms = current['item']['duration_ms']
+                    progress_ms = current['progress_ms']
+                    self.updated_time = int(self.ms_to_sec(int(current["progress_ms"])))
+                    self.song = title
+                    with open("./Lyrics/no_lyrics_list.txt", "r") as f:
+                        lines = f.readlines()
+                        for line in lines:
+                            if line == self.song + "\n":
+                                return self.raw_song + " - No Lyrics"
+                    return True
+                elif current_type == "ad":
+                    print(">> ad popped up -- sleeping...")
+                    return "Ad Is playing"
+            else:
+                return "Nothing Playing On Spotify"
+        except Exception as e:
+            return "Error Occured While Trying To Get Song!" + str(e)
 
-    def get_lyrics(self):
-        if not LyricsFetcher.check_if_no_lyrics(self.song):
-            lyrics_path = f"{LyricsFetcher.LYRICS_DIR}/{self.song}.lrc"
-            if not os.path.exists(lyrics_path):
+    def getlyrics(self):
+        print("Getting lyrics")
+        if not self.check_if_song():
+            if not os.path.exists(f"./Lyrics/{self.song}" + ".lrc"):
                 try:
                     self.new_message.emit("Getting Lyrics...")
-                    lyrics = LyricsFetcher.fetch_lyrics(self.song)
-                    if lyrics:
+                    lrc = syncedlyrics.search(self.song)
+                    if lrc or lrc == "":
+                        with open(f"Lyrics/{self.song}" + ".lrc", "w", encoding="utf-8") as f:
+                            f.write(lrc)
+                            f.close()
                         return True
                     else:
-                        return f"{self.raw_song} - No Lyrics"
+                        with open("./Lyrics/no_lyrics_list.txt", "a") as f:
+                            f.write(self.song + "\n")
+                            f.close()
+                        return self.raw_song + " - No Lyrics"
                 except Exception as e:
-                    return f"Error occurred while getting lyrics: {e}"
+                    with open("./Lyrics/no_lyrics_list.txt", "a") as f:
+                            f.write(self.song + "\n")
+                            f.close()
+                    return "Error occured while getting lyrics"
             else:
                 return True
         else:
-            return f"{self.raw_song} - No Lyrics"
+            return "Error occured while getting lyrics"
 
     def play_line(self, pause_event, skip_event, kill_event):
         self.new_message.emit("...")
-        self.detail_message.emit(f"{self.raw_song} - Playing")
-        current = self.spotify_client.get_current_track()
-        progress_ms = SpotifyClient.ms_to_sec(current["progress_ms"])
-        
-        with open(f"{LyricsFetcher.LYRICS_DIR}/{self.song}.lrc", "r", encoding="utf-8") as f:
-            lines = f.readlines()
-
-        i = 0
+        self.detail_message.emit(self.raw_song + " - Playing")
+        current = self.get_current()
+        progress_ms = int(self.ms_to_sec(int(current["progress_ms"])))
+        lines = None
+        counter = 0
         last_time = 0
-        while i < len(lines):
+        with open(f"Lyrics/{self.song}" + ".lrc", "r", encoding="utf-8") as f:
+            lines = f.read()
+            lines = lines.split("\n")
+        i = 0
+        kill_trigger = False
+        while i <= len(lines) - 1:
+            try:
+                test = lines[i+1]
+            except:
+                kill_trigger = True
             if kill_event.is_set():
                 return
             if pause_event.is_set():
+                print("Song paused!")
                 while pause_event.is_set():
                     time.sleep(0.1)
+                print("Song resumed")
             if skip_event.is_set():
+                self.new_message.emit("...")
+                print("Song skipped\n\n\n\n")
                 i = 0
-                new_time = SpotifyClient.ms_to_sec(self.spotify_client.get_current_track()["progress_ms"])
+                counter = 0
+                new_time = int(self.ms_to_sec(self.get_current()["progress_ms"]))
                 progress_ms = new_time
+                self.skiped = False
                 self.updated_time = new_time
                 skip_event.clear()
                 continue
-
-            ts = SpotifyClient.ts_to_sec(lines[i].split("]")[0])
+            ts = lines[i].split("]")[0]
+            ts = self.ts_to_sec(ts)
             self.updated_time = ts
-            if ts >= progress_ms:
-                self.sleep_check_pause(ts - progress_ms, pause_event)
-                self.new_message.emit(lines[i].split("]")[1].strip())
-                last_time = ts
+            if counter == 0:
+                self.new_message.emit("...")
+                if ts >= progress_ms:
+                    self.sleep_check_pause(int(ts) - int(progress_ms), pause_event)
+                    emmit_lyrics = lines[i].split("]")[1]
+                    self.new_message.emit(emmit_lyrics)
+                    if self.paused:
+                        i = 0
+                        counter = 0
+                        self.paused = False
+                        continue
+                    last_time = ts
+                    counter += 1
+                else:
+                    i += 1
+                    continue
             else:
-                i += 1
-                continue
-
+                ts = lines[i].split("]")[0]
+                ts = self.ts_to_sec(ts)
+                self.sleep_check_pause(ts - last_time, pause_event)
+                if self.paused:
+                    i = 0
+                    counter = 0
+                    self.paused = False
+                    progress_ms = int(self.ms_to_sec(self.get_current()["progress_ms"]))
+                    continue
+                emmit_lyrics = lines[i].split("]")[1]
+                self.new_message.emit(emmit_lyrics)
+                last_time = ts
             i += 1
+            if kill_trigger:
+                return
 
     def show_lyrics(self):
+        """
+        Starts a thread to play the lyrics for the current song.
+        """
+
         pause_event = threading.Event()
         skip_event = threading.Event()
         kill_event = threading.Event()
-        thread = threading.Thread(target=self.play_line, args=(pause_event, skip_event, kill_event))
+        thread = threading.Thread(target=self.play_line, args=(pause_event, skip_event, kill_event, ))
         thread.start()
         paused = False
-
-        while not self.blast:
+        resumed = True
+        while True:
+            if self.blast:
+                kill_event.set()
+                return
             if not thread.is_alive():
                 self.detail_message.emit("Spotify Lyrics Shower...")
                 return "Song Ended"
-            current = self.spotify_client.get_current_track()
+            current = self.get_current()
             if not current:
                 kill_event.set()
                 self.detail_message.emit("Spotify Lyrics Shower...")
                 return "Spotify OFF!"
             try:
-                title = f"[{current['item']['name']}] [{current['item']['artists'][0]['name']}]"
+                resuming = current["actions"]["disallows"]["resuming"]
+                title = "[" + current['item']['name'] + "] [" + current["item"]["artists"][0]["name"] + "]"
                 if self.song != title:
+                    print("Song changed! Breaking!")
                     kill_event.set()
-                    return "Song Changed"
-                new_time = SpotifyClient.ms_to_sec(current["progress_ms"])
-                if abs(new_time - self.updated_time) > 10:
+                    return
+                new_time = int(self.ms_to_sec(int(current["progress_ms"])))
+
+                if not new_time <= self.updated_time+10 or not new_time >= self.updated_time-10:
                     skip_event.set()
-                self.detail_message.emit(f"{self.raw_song} - Playing")
+                    self.skiped = True
+                if not resumed:
+                    pause_event.clear()
+                    resumed = True
+                    paused = False
+                self.detail_message.emit(self.raw_song + " - Playing")
             except Exception as e:
                 if not paused:
-                    self.detail_message.emit(f"{self.raw_song} - Paused")
+                    self.detail_message.emit(self.raw_song + " - Paused")
                     pause_event.set()
+                    resumed = False
                     paused = True
             time.sleep(1)
 
-    @staticmethod
-    def sleep_check_pause(duration, pause_event):
+    def sleep_check_pause(self, duration, pause_event):
+
         start_time = time.time()
         while time.time() - start_time < duration:
             if pause_event.is_set():
+                print("Song paused!")
                 while pause_event.is_set():
                     time.sleep(0.1)
+                self.paused = True
+                if not pause_event.is_set():
+                    print("Song resumed!")
                 return
             time.sleep(0.1)
+class text_class:
+    def window(self):
+        app = QApplication([])
+        window = QWidget()
+        # window.setWindowFlags(Qt.FramelessWindowHint)
+        window.setAttribute(Qt.WA_TranslucentBackground)
+        window.setStyleSheet("background-color: rgba(0, 0, 0, 0);")
+        screen_geometry = app.primaryScreen().geometry()
+        window.setGeometry(screen_geometry)
 
-class TextOverlayApp:
-    def __init__(self):
-        self.app = QApplication([])
-        self.window = QWidget()
-        self.window.setAttribute(Qt.WA_TranslucentBackground)
-        self.window.setStyleSheet("background-color: rgba(0, 0, 0, 0);")
-        self.window.setWindowFlags(Qt.FramelessWindowHint | Qt.Tool)
-        
-        self.layout = QVBoxLayout()
-        self.layout.setAlignment(Qt.AlignRight | Qt.AlignBottom)
-        self.layout.setContentsMargins(0, 0, 30, 50)
-        
-        self.label = QLabel("....")
+        window.setWindowFlags(
+            Qt.FramelessWindowHint |
+            Qt.Tool
+        )
+
+        layout = QVBoxLayout()
+        layout.setAlignment(Qt.AlignRight | Qt.AlignBottom)
+        layout.setContentsMargins(0, 0, 30, 50)
+
+        self.label = QLabel()
+        self.label.setText("....")
         self.label.setStyleSheet("color: rgba(255, 255, 255, 255);")
         self.label.setFont(QFont("Dancing Script", 25))
+        self.label.setFixedWidth(screen_geometry.width() - 100) 
         self.label.setAlignment(Qt.AlignRight)
 
-        self.details = QLabel("Spotify Lyrics Shower!")
+        self.details = QLabel()
+        self.details.setText("Spotify Lyrics Shower!")
         self.details.setStyleSheet("color: rgba(255, 255, 255, 255); font-weight: 500px")
         self.details.setFont(QFont("Dancing Script", 20))
+        self.details.setFixedWidth(screen_geometry.width() - 100) 
         self.details.setAlignment(Qt.AlignRight)
 
-        self.layout.addWidget(self.label)
-        self.layout.addWidget(self.details)
-        self.window.setLayout(self.layout)
-        
-        self.setup_tray_icon()
 
+        label_effect = QGraphicsOpacityEffect(self.label, opacity=1.0)
+        self.label.setGraphicsEffect(label_effect)
+        self._animation = QPropertyAnimation(
+            self.label,
+            propertyName=b"opacity",
+            targetObject=label_effect,
+            duration=300,
+            startValue=0.0,
+            endValue=1.0,
+        )
+
+
+        details_effect = QGraphicsOpacityEffect(self.details, opacity=1.0)
+        self.details.setGraphicsEffect(details_effect)
+        self._animation_details = QPropertyAnimation(
+            self.details,
+            propertyName=b"opacity",
+            targetObject=details_effect,
+            duration=100,
+            startValue=0.0,
+            endValue=1.0,
+        )
+
+
+        layout.addWidget(self.label)
+        layout.addWidget(self.details)
+
+        window.setLayout(layout)
+        
         self.main = Main()
         self.main.new_message.connect(self.update_label_text)
-        self.main.detail_message.connect(self.update_detail_text)
+        self.main.detail_message.connect(self.update_detail_Text)
+        self.tray_icon = QSystemTrayIcon(window)
+        self.tray_icon.setIcon(QIcon("icon.png")) 
 
-    def setup_tray_icon(self):
-        self.tray_icon = QSystemTrayIcon(self.window)
-        self.tray_icon.setIcon(QIcon("icon.png"))
-
-        show_action = QAction("Show", self.window)
-        hide_action = QAction("Hide", self.window)
-        quit_action = QAction("Exit", self.window)
-        show_action.triggered.connect(self.window.show)
-        hide_action.triggered.connect(self.window.hide)
+        show_action = QAction("Show", window)
+        quit_action = QAction("Exit", window)
+        hide_action = QAction("Hide", window)
+        show_action.triggered.connect(window.show)
+        hide_action.triggered.connect(window.hide)
         quit_action.triggered.connect(self.quit_app)
 
         tray_menu = QMenu()
         tray_menu.addAction(show_action)
         tray_menu.addAction(hide_action)
         tray_menu.addAction(quit_action)
-        
+
         self.tray_icon.setContextMenu(tray_menu)
         self.tray_icon.show()
+        self.win_copy = window
+        return window, app
 
-    def update_label_text(self, text):
-        self.label.setText(text)
-        self.animate_label_opacity(self.label)
-
-    def update_detail_text(self, text):
-        self.details.setText(text)
-        self.animate_label_opacity(self.details)
-
-    @staticmethod
-    def animate_label_opacity(label):
-        opacity_effect = QGraphicsOpacityEffect()
-        label.setGraphicsEffect(opacity_effect)
-        animation = QPropertyAnimation(opacity_effect, b"opacity")
-        animation.setDuration(1000)
-        animation.setStartValue(0)
-        animation.setEndValue(1)
-        animation.start()
+    def update_label_text(self, lyrics):
+        if self.label.text() != lyrics:
+            self.fade_out()
+            self.label.setText(lyrics)
+            self.fade_in()
 
     def quit_app(self):
+        self.tray_icon.hide()
+        self.win_copy.hide()
         self.main.blast = True
-        self.app.quit()
+        QApplication.exit()
+        app.exit()
+        exit(0)
 
-    def run(self):
-        self.window.show()
-        self.main_thread = threading.Thread(target=self.main.start)
-        self.main_thread.start()
-        sys.exit(self.app.exec_())
+    def update_detail_Text(self, details):
+        if details != self.details.text():
+            loop = QEventLoop()
+            self._animation_details.finished.connect(loop.quit)
+            self._animation_details.setDirection(QPropertyAnimation.Backward)
+            self._animation_details.start()
+            loop.exec_()
+            self.details.setText(details)
+            self._animation_details.setDirection(QPropertyAnimation.Forward)
+            self._animation_details.start()
+
+    def fade_in(self):
+        self._animation.setDirection(QPropertyAnimation.Forward)
+        self._animation.start()
+
+    def fade_out(self):
+        loop = QEventLoop()
+        self._animation.finished.connect(loop.quit)
+        self._animation.setDirection(QPropertyAnimation.Backward)
+        self._animation.start()
+        loop.exec_()
 
 if __name__ == "__main__":
-    print("Program Made By Praveen, Github:- https://github.com/Praveen-debug")
-    app = TextOverlayApp()
-    app.run()
+    program = text_class()
+    window, app = program.window()
+    window.show()
+    threading.Thread(target=program.main.start).start()
+    app.exec()
